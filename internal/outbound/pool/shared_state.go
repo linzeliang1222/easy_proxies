@@ -15,7 +15,7 @@ type sharedMemberState struct {
 	failures         int
 	blacklisted      bool
 	blacklistedUntil time.Time
-	entry            *monitor.EntryHandle
+	entry            atomic.Pointer[monitor.EntryHandle]
 	active           atomic.Int32
 }
 
@@ -52,16 +52,11 @@ func (s *sharedMemberState) attachEntry(entry *monitor.EntryHandle) {
 	if entry == nil {
 		return
 	}
-	s.mu.Lock()
-	s.entry = entry
-	s.mu.Unlock()
+	s.entry.Store(entry)
 }
 
 func (s *sharedMemberState) entryHandle() *monitor.EntryHandle {
-	s.mu.Lock()
-	entry := s.entry
-	s.mu.Unlock()
-	return entry
+	return s.entry.Load()
 }
 
 // recordFailure increments failure count and triggers blacklist if threshold reached.
@@ -79,10 +74,9 @@ func (s *sharedMemberState) recordFailure(cause error, threshold int, duration t
 		s.blacklisted = true
 		s.blacklistedUntil = until
 	}
-	entry := s.entry
 	s.mu.Unlock()
 
-	if entry != nil {
+	if entry := s.entry.Load(); entry != nil {
 		entry.RecordFailure(cause)
 		if triggered {
 			entry.Blacklist(until)
@@ -94,10 +88,9 @@ func (s *sharedMemberState) recordFailure(cause error, threshold int, duration t
 func (s *sharedMemberState) recordSuccess() {
 	s.mu.Lock()
 	s.failures = 0
-	entry := s.entry
 	s.mu.Unlock()
 
-	if entry != nil {
+	if entry := s.entry.Load(); entry != nil {
 		entry.RecordSuccess()
 	}
 }
@@ -111,11 +104,12 @@ func (s *sharedMemberState) isBlacklisted(now time.Time) bool {
 		s.blacklistedUntil = time.Time{}
 	}
 	blacklisted := s.blacklisted
-	entry := s.entry
 	s.mu.Unlock()
 
-	if expired && entry != nil {
-		entry.ClearBlacklist()
+	if expired {
+		if entry := s.entry.Load(); entry != nil {
+			entry.ClearBlacklist()
+		}
 	}
 	return blacklisted
 }
@@ -125,30 +119,23 @@ func (s *sharedMemberState) forceRelease() {
 	s.failures = 0
 	s.blacklisted = false
 	s.blacklistedUntil = time.Time{}
-	entry := s.entry
 	s.mu.Unlock()
 
-	if entry != nil {
+	if entry := s.entry.Load(); entry != nil {
 		entry.ClearBlacklist()
 	}
 }
 
 func (s *sharedMemberState) incActive() {
 	s.active.Add(1)
-	s.mu.Lock()
-	entry := s.entry
-	s.mu.Unlock()
-	if entry != nil {
+	if entry := s.entry.Load(); entry != nil {
 		entry.IncActive()
 	}
 }
 
 func (s *sharedMemberState) decActive() {
 	s.active.Add(-1)
-	s.mu.Lock()
-	entry := s.entry
-	s.mu.Unlock()
-	if entry != nil {
+	if entry := s.entry.Load(); entry != nil {
 		entry.DecActive()
 	}
 }

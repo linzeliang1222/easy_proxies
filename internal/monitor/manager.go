@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -171,7 +172,7 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 	}
 }
 
-// probeAllNodes checks all registered nodes.
+// probeAllNodes checks all registered nodes concurrently.
 func (m *Manager) probeAllNodes(timeout time.Duration) {
 	m.mu.RLock()
 	entries := make([]*entry, 0, len(m.nodes))
@@ -188,8 +189,14 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 		m.logger.Info("starting health check for ", len(entries), " nodes")
 	}
 
-	availableCount := 0
-	failedCount := 0
+	workerLimit := runtime.NumCPU() * 2
+	if workerLimit < 8 {
+		workerLimit = 8
+	}
+	sem := make(chan struct{}, workerLimit)
+	var wg sync.WaitGroup
+	var availableCount atomic.Int32
+	var failedCount atomic.Int32
 
 	for _, e := range entries {
 		e.mu.RLock()
@@ -201,32 +208,41 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 			continue
 		}
 
-		ctx, cancel := context.WithTimeout(m.ctx, timeout)
-		latency, err := probeFn(ctx)
-		cancel()
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(entry *entry, probe probeFunc, tag string) {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-		e.mu.Lock()
-		if err != nil {
-			failedCount++
-			e.lastError = err.Error()
-			e.lastFail = time.Now()
-			e.available = false
-			e.initialCheckDone = true
-			if m.logger != nil {
+			ctx, cancel := context.WithTimeout(m.ctx, timeout)
+			latency, err := probe(ctx)
+			cancel()
+
+			entry.mu.Lock()
+			if err != nil {
+				failedCount.Add(1)
+				entry.lastError = err.Error()
+				entry.lastFail = time.Now()
+				entry.available = false
+				entry.initialCheckDone = true
+			} else {
+				availableCount.Add(1)
+				entry.lastOK = time.Now()
+				entry.lastProbe = latency
+				entry.available = true
+				entry.initialCheckDone = true
+			}
+			entry.mu.Unlock()
+
+			if err != nil && m.logger != nil {
 				m.logger.Warn("probe failed for ", tag, ": ", err)
 			}
-		} else {
-			availableCount++
-			e.lastOK = time.Now()
-			e.lastProbe = latency
-			e.available = true
-			e.initialCheckDone = true
-		}
-		e.mu.Unlock()
+		}(e, probeFn, tag)
 	}
+	wg.Wait()
 
 	if m.logger != nil {
-		m.logger.Info("health check completed: ", availableCount, " available, ", failedCount, " failed")
+		m.logger.Info("health check completed: ", availableCount.Load(), " available, ", failedCount.Load(), " failed")
 	}
 }
 

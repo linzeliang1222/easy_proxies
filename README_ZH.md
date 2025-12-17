@@ -496,6 +496,10 @@ go build -o easy-proxies ./cmd/easy_proxies
 go build -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" -o easy-proxies ./cmd/easy_proxies
 ```
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=jasonwong1991/easy_proxies&type=Date)](https://star-history.com/#jasonwong1991/easy_proxies&Date)
+
 ## 许可证
 
 MIT License

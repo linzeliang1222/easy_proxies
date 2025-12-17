@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"easy_proxies/internal/monitor"
@@ -65,16 +66,18 @@ type memberState struct {
 
 type poolOutbound struct {
 	outbound.Adapter
-	ctx     context.Context
-	logger  log.ContextLogger
-	manager adapter.OutboundManager
-	options Options
-	mode    string
-	members []*memberState
-	mu      sync.Mutex
-	rrIndex int
-	rng     *rand.Rand
-	monitor *monitor.Manager
+	ctx            context.Context
+	logger         log.ContextLogger
+	manager        adapter.OutboundManager
+	options        Options
+	mode           string
+	members        []*memberState
+	mu             sync.Mutex
+	rrCounter      atomic.Uint32
+	rng            *rand.Rand
+	rngMu          sync.Mutex // protects rng for random mode
+	monitor        *monitor.Manager
+	candidatesPool sync.Pool
 }
 
 func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options Options) (adapter.Outbound, error) {
@@ -87,6 +90,7 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 	}
 	monitorMgr := monitor.FromContext(ctx)
 	normalized := normalizeOptions(options)
+	memberCount := len(normalized.Members)
 	p := &poolOutbound{
 		Adapter: outbound.NewAdapter(Type, tag, []string{N.NetworkTCP, N.NetworkUDP}, normalized.Members),
 		ctx:     ctx,
@@ -96,6 +100,11 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 		mode:    normalized.Mode,
 		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
 		monitor: monitorMgr,
+		candidatesPool: sync.Pool{
+			New: func() any {
+				return make([]*memberState, 0, memberCount)
+			},
+		},
 	}
 
 	// Register nodes immediately if monitor is available
@@ -333,29 +342,40 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 }
 
 func (p *poolOutbound) pickMember(network string) (*memberState, error) {
+	now := time.Now()
+	candidates := p.getCandidateBuffer()
+
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	// Lazy initialization: initialize members on first use if not already done
 	if len(p.members) == 0 {
 		if err := p.initializeMembersLocked(); err != nil {
+			p.mu.Unlock()
+			p.putCandidateBuffer(candidates)
 			return nil, err
 		}
 	}
-	now := time.Now()
-	available := p.availableMembersLocked(now, network)
-	if len(available) == 0 {
+	candidates = p.availableMembersLocked(now, network, candidates)
+	p.mu.Unlock()
+
+	if len(candidates) == 0 {
+		p.mu.Lock()
 		if p.releaseIfAllBlacklistedLocked(now) {
-			available = p.availableMembersLocked(now, network)
+			candidates = p.availableMembersLocked(now, network, candidates)
 		}
+		p.mu.Unlock()
 	}
-	if len(available) == 0 {
+
+	if len(candidates) == 0 {
+		p.putCandidateBuffer(candidates)
 		return nil, E.New("no healthy proxy available")
 	}
-	return p.selectMemberLocked(available), nil
+
+	member := p.selectMember(candidates)
+	p.putCandidateBuffer(candidates)
+	return member, nil
 }
 
-func (p *poolOutbound) availableMembersLocked(now time.Time, network string) []*memberState {
-	result := make([]*memberState, 0, len(p.members))
+func (p *poolOutbound) availableMembersLocked(now time.Time, network string, buf []*memberState) []*memberState {
+	result := buf[:0]
 	for _, member := range p.members {
 		// Check blacklist via shared state (auto-clears if expired)
 		if member.shared != nil && member.shared.isBlacklisted(now) {
@@ -389,10 +409,13 @@ func (p *poolOutbound) releaseIfAllBlacklistedLocked(now time.Time) bool {
 	return true
 }
 
-func (p *poolOutbound) selectMemberLocked(candidates []*memberState) *memberState {
+func (p *poolOutbound) selectMember(candidates []*memberState) *memberState {
 	switch p.mode {
 	case modeRandom:
-		return candidates[p.rng.Intn(len(candidates))]
+		p.rngMu.Lock()
+		idx := p.rng.Intn(len(candidates))
+		p.rngMu.Unlock()
+		return candidates[idx]
 	case modeBalance:
 		var selected *memberState
 		var minActive int32
@@ -408,9 +431,8 @@ func (p *poolOutbound) selectMemberLocked(candidates []*memberState) *memberStat
 		}
 		return selected
 	default:
-		member := candidates[p.rrIndex%len(candidates)]
-		p.rrIndex = (p.rrIndex + 1) % len(candidates)
-		return member
+		idx := int(p.rrCounter.Add(1)-1) % len(candidates)
+		return candidates[idx]
 	}
 }
 
@@ -624,4 +646,22 @@ func (p *poolOutbound) decActive(member *memberState) {
 	if member.shared != nil {
 		member.shared.decActive()
 	}
+}
+
+func (p *poolOutbound) getCandidateBuffer() []*memberState {
+	if buf := p.candidatesPool.Get(); buf != nil {
+		return buf.([]*memberState)
+	}
+	return make([]*memberState, 0, len(p.options.Members))
+}
+
+func (p *poolOutbound) putCandidateBuffer(buf []*memberState) {
+	if buf == nil {
+		return
+	}
+	const maxCached = 4096
+	if cap(buf) > maxCached {
+		return
+	}
+	p.candidatesPool.Put(buf[:0])
 }

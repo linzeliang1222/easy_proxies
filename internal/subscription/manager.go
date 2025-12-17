@@ -51,7 +51,8 @@ type Manager struct {
 	manualRefresh chan struct{}
 
 	// Track nodes.txt content hash to detect modifications
-	lastSubHash string // Hash of nodes.txt content after last subscription refresh
+	lastSubHash      string    // Hash of nodes.txt content after last subscription refresh
+	lastNodesModTime time.Time // Last known modification time of nodes.txt
 }
 
 // New creates a SubscriptionManager.
@@ -232,10 +233,15 @@ func (m *Manager) doRefresh() {
 	}
 	m.logger.Infof("written %d nodes to %s", len(nodes), nodesFilePath)
 
-	// Update hash after writing
+	// Update hash and mod time after writing
 	newHash := m.computeNodesHash(nodes)
 	m.mu.Lock()
 	m.lastSubHash = newHash
+	if info, err := os.Stat(nodesFilePath); err == nil {
+		m.lastNodesModTime = info.ModTime()
+	} else {
+		m.lastNodesModTime = time.Now()
+	}
 	m.status.NodesModified = false
 	m.mu.Unlock()
 
@@ -294,17 +300,30 @@ func (m *Manager) computeNodesHash(nodes []config.NodeConfig) string {
 }
 
 // CheckNodesModified checks if nodes.txt has been modified since last refresh.
+// Uses file modification time as a fast path to avoid unnecessary file reads.
 func (m *Manager) CheckNodesModified() bool {
 	m.mu.RLock()
 	lastHash := m.lastSubHash
+	lastMod := m.lastNodesModTime
 	m.mu.RUnlock()
 
 	if lastHash == "" {
 		return false // No previous refresh, can't determine modification
 	}
 
-	// Read current nodes.txt and compute hash
 	nodesFilePath := m.getNodesFilePath()
+
+	// Fast path: check modification time first
+	info, err := os.Stat(nodesFilePath)
+	if err != nil {
+		return false // File doesn't exist or can't stat
+	}
+	modTime := info.ModTime()
+	if !modTime.After(lastMod) {
+		return false // File hasn't been modified
+	}
+
+	// Slow path: file was modified, compute hash
 	data, err := os.ReadFile(nodesFilePath)
 	if err != nil {
 		return false // File doesn't exist or can't read
@@ -324,7 +343,14 @@ func (m *Manager) CheckNodesModified() bool {
 	}
 
 	currentHash := m.computeNodesHash(nodes)
-	return currentHash != lastHash
+	changed := currentHash != lastHash
+
+	// Update cached mod time
+	m.mu.Lock()
+	m.lastNodesModTime = modTime
+	m.mu.Unlock()
+
+	return changed
 }
 
 // MarkNodesModified updates the modification status.

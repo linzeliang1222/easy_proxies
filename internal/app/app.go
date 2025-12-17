@@ -40,6 +40,11 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 	defer boxMgr.Close()
 
+	// Wire up config to monitor server for settings API
+	if server := boxMgr.MonitorServer(); server != nil {
+		server.SetConfig(cfg)
+	}
+
 	// Create and start SubscriptionManager if enabled
 	var subMgr *subscription.Manager
 	if cfg.SubscriptionRefresh.Enabled && len(cfg.Subscriptions) > 0 {
